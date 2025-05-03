@@ -1,9 +1,8 @@
-﻿using System;
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
-using System.Threading.Tasks;
-using System.Threading;
 using Websocket.Client;
+
+namespace Client;
 
 class Program
 {
@@ -28,10 +27,11 @@ class Program
 
         // Append remote host and port to the URL
         string wsUrl = $"{serverUrl}/{remoteHost}/{remotePort}";
-        
+
         var tcpListener = new TcpListener(IPAddress.Any, localPort);
         tcpListener.Start();
-        Console.WriteLine($"Listening on port {localPort}");
+        Console.WriteLine($"Port forwarder listening on port {localPort}");
+        Console.WriteLine($"Forwarding to {remoteHost}:{remotePort} via {wsUrl}");
 
         while (true)
         {
@@ -44,45 +44,91 @@ class Program
     {
         try
         {
+            Console.WriteLine($"New client connected from {tcpClient.Client.RemoteEndPoint}");
+
             using (tcpClient)
-            using (var networkStream = tcpClient.GetStream())
+            await using (var networkStream = tcpClient.GetStream())
             {
                 var exitEvent = new ManualResetEvent(false);
-                using (var websocket = new WebsocketClient(new Uri(wsUrl)))
+                var url = new Uri(wsUrl);
+
+                using (var websocket = new WebsocketClient(url))
                 {
+                    // Configure WebSocket client
+                    websocket.ReconnectTimeout = null;
+                    websocket.ErrorReconnectTimeout = TimeSpan.FromSeconds(10);
+
                     // Handle incoming WebSocket messages
                     websocket.MessageReceived.Subscribe(msg =>
                     {
-                        if (msg.Binary != null)
+                        try
                         {
-                            networkStream.Write(msg.Binary, 0, msg.Binary.Length);
+                            if (msg.Binary != null)
+                            {
+                                networkStream.Write(msg.Binary, 0, msg.Binary.Length);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error writing to TCP stream: {ex.Message}");
+                            exitEvent.Set();
                         }
                     });
 
+                    // Handle disconnection
                     websocket.DisconnectionHappened.Subscribe(info =>
                     {
-                        exitEvent.Set();
+                        Console.WriteLine($"WebSocket disconnected: {info.Type}");
+                        if (info.Type != DisconnectionType.Exit)
+                        {
+                            exitEvent.Set();
+                        }
+                    });
+
+                    // Handle reconnection
+                    websocket.ReconnectionHappened.Subscribe(info =>
+                    {
+                        Console.WriteLine($"WebSocket reconnected: {info.Type}");
                     });
 
                     await websocket.Start();
+                    Console.WriteLine("WebSocket connected");
 
                     // Read from TCP and send to WebSocket
-                    byte[] buffer = new byte[4096];
-                    while (true)
+                    try
                     {
-                        int bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length);
-                        if (bytesRead == 0) break;
+                        byte[] buffer = new byte[4096];
+                        while (!exitEvent.WaitOne(0))
+                        {
+                            int bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length);
+                            if (bytesRead == 0) break; // Client disconnected
 
-                        await websocket.SendAsync(buffer[..bytesRead]);
+                            // Create a new array with just the read bytes
+                            byte[] dataToSend = new byte[bytesRead];
+                            Array.Copy(buffer, 0, dataToSend, 0, bytesRead);
+
+                            // Send the data using the correct method
+                            websocket.Send(dataToSend);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error reading from TCP stream: {ex.Message}");
                     }
 
-                    await websocket.Stop(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "");
+                    // Clean shutdown
+                    await websocket.Stop(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Closing");
+                    await Task.Delay(1000); // Give it time to close cleanly
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error: {ex.Message}");
+            Console.WriteLine($"Error handling client: {ex.Message}");
+        }
+        finally
+        {
+            Console.WriteLine("Client disconnected");
         }
     }
 }

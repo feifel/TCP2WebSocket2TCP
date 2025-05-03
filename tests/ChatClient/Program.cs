@@ -1,8 +1,7 @@
-﻿// EchoClient.cs
-using System;
-using System.Net.Sockets;
+﻿using System.Net.Sockets;
 using System.Text;
-using System.Threading.Tasks;
+
+namespace ChatClient;
 
 class EchoClient
 {
@@ -19,27 +18,23 @@ class EchoClient
 
         try
         {
-            using (TcpClient client = new TcpClient())
+            using TcpClient client = new TcpClient();
+            await client.ConnectAsync(host, port);
+            Console.WriteLine($"ChatClient connected to {host}:{port}");
+
+            await using var stream = client.GetStream();
+            // Start a task to read responses
+            var readTask = ReadResponsesAsync(stream);
+
+            // Handle user input
+            Console.Write("Input (press Ctrl+C to exit): ");
+            while (true)
             {
-                await client.ConnectAsync(host, port);
-                Console.WriteLine($"Connected to {host}:{port}");
+                string? input = Console.ReadLine();
+                if (string.IsNullOrEmpty(input)) continue;
 
-                using (NetworkStream stream = client.GetStream())
-                {
-                    // Start a task to read responses
-                    var readTask = ReadResponsesAsync(stream);
-
-                    // Handle user input
-                    Console.WriteLine("Type your messages (press Ctrl+C to exit):");
-                    while (true)
-                    {
-                        string input = Console.ReadLine();
-                        if (string.IsNullOrEmpty(input)) continue;
-
-                        byte[] data = Encoding.UTF8.GetBytes(input + "\n");
-                        await stream.WriteAsync(data, 0, data.Length);
-                    }
-                }
+                byte[] data = Encoding.UTF8.GetBytes(input + "\n");
+                await stream.WriteAsync(data, 0, data.Length);
             }
         }
         catch (Exception ex)
@@ -60,6 +55,7 @@ class EchoClient
 
                 string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
                 Console.Write(response);
+                Console.Write("Input: ");
             }
         }
         catch (Exception ex)

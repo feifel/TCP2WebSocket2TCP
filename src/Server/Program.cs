@@ -1,8 +1,11 @@
-using Microsoft.AspNetCore.Server.IIS;
+using System.Net.WebSockets;
+using System.Net.Sockets;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+builder.Logging.AddConsole(); // Add console logger
+
+// Add any additional services if needed
 builder.Services.Configure<IISServerOptions>(options =>
 {
     options.MaxRequestBodySize = int.MaxValue; // Or set an appropriate limit
@@ -13,10 +16,12 @@ var app = builder.Build();
 // Configure websocket options
 var webSocketOptions = new WebSocketOptions
 {
-    KeepAliveInterval = TimeSpan.FromMinutes(2),
-    ReceiveBufferSize = 4096
+    KeepAliveInterval = TimeSpan.FromSeconds(20)
 };
 app.UseWebSockets(webSocketOptions);
+
+// Add basic health check endpoint
+app.MapGet("/health", () => "Healthy");
 
 app.Use(async (context, next) =>
 {
@@ -43,8 +48,7 @@ app.Use(async (context, next) =>
     }
     else
     {
-        context.Response.StatusCode = 400;
-        await context.Response.WriteAsync("Only WebSocket requests are supported");
+        await next();
     }
 });
 
@@ -56,7 +60,7 @@ async Task HandleWebSocketConnection(WebSocket webSocket, string remoteHost, int
     {
         using var tcpClient = new TcpClient();
         await tcpClient.ConnectAsync(remoteHost, remotePort);
-        using var networkStream = tcpClient.GetStream();
+        await using var networkStream = tcpClient.GetStream();
 
         var cancellation = new CancellationTokenSource();
         var receiveTask = ReceiveWebSocketMessages(webSocket, networkStream, cancellation.Token);
@@ -67,22 +71,22 @@ async Task HandleWebSocketConnection(WebSocket webSocket, string remoteHost, int
 
         if (webSocket.State == WebSocketState.Open)
         {
-            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, 
+            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure,
                 "Connection closed", CancellationToken.None);
         }
     }
     catch (Exception ex)
     {
-        // Log the error
+        app.Logger.LogError(ex, "Error in WebSocket connection");
         if (webSocket.State == WebSocketState.Open)
         {
-            await webSocket.CloseAsync(WebSocketCloseStatus.InternalServerError, 
+            await webSocket.CloseAsync(WebSocketCloseStatus.InternalServerError,
                 "Connection error", CancellationToken.None);
         }
     }
 }
 
-async Task ReceiveWebSocketMessages(WebSocket webSocket, NetworkStream networkStream, 
+async Task ReceiveWebSocketMessages(WebSocket webSocket, NetworkStream networkStream,
     CancellationToken cancellationToken)
 {
     var buffer = new byte[4096];
@@ -103,7 +107,7 @@ async Task ReceiveWebSocketMessages(WebSocket webSocket, NetworkStream networkSt
     }
 }
 
-async Task SendTcpDataToWebSocket(WebSocket webSocket, NetworkStream networkStream, 
+async Task SendTcpDataToWebSocket(WebSocket webSocket, NetworkStream networkStream,
     CancellationToken cancellationToken)
 {
     var buffer = new byte[4096];

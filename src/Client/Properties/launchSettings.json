@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Client": {
+      "commandName": "Project",
+      "commandLineArgs": "12344 localhost:58732 localhost 12345"
+    }
+  }
+}
