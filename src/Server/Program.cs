@@ -1,130 +1,184 @@
 using System.Net.WebSockets;
 using System.Net.Sockets;
+using NLog;
+using NLog.Web;
 
-var builder = WebApplication.CreateBuilder(args);
+// Early init of NLog to allow startup logging  
+var logger = LogManager.Setup()
+    .LoadConfigurationFromFile("nlog.config")
+    .GetCurrentClassLogger();
 
-builder.Logging.AddConsole(); // Add console logger
-
-// Add any additional services if needed
-builder.Services.Configure<IISServerOptions>(options =>
+try
 {
-    options.MaxRequestBodySize = int.MaxValue; // Or set an appropriate limit
-});
+    var builder = WebApplication.CreateBuilder(args);
 
-var app = builder.Build();
+    // Add NLog  
+    builder.Logging.ClearProviders();
+    builder.Host.UseNLog();
 
-// Configure websocket options
-var webSocketOptions = new WebSocketOptions
-{
-    KeepAliveInterval = TimeSpan.FromSeconds(20)
-};
-app.UseWebSockets(webSocketOptions);
-
-// Add basic health check endpoint
-app.MapGet("/health", () => "Healthy");
-
-app.Use(async (context, next) =>
-{
-    if (context.WebSockets.IsWebSocketRequest)
+    builder.Services.Configure<IISServerOptions>(options =>
     {
+        options.MaxRequestBodySize = int.MaxValue;
+    });
+
+    var app = builder.Build();
+
+    // Test logging  
+    app.Logger.LogInformation("Application Started");
+
+    var webSocketOptions = new WebSocketOptions
+    {
+        KeepAliveInterval = TimeSpan.FromSeconds(20)
+    };
+    app.UseWebSockets(webSocketOptions);
+
+    // Add basic health check endpoint
+    app.MapGet("/health", () => "Healthy");
+
+    // Explicitly specify RequestDelegate to resolve the ambiguity using Microsoft.AspNetCore.Http;  
+    app.Use(async (context, next) =>
+    {
+        app.Logger.LogInformation($"Received request for {context.Request.Path}");
+
+        // Skip processing for health endpoint  
+        if (context.Request.Path.StartsWithSegments("/health"))
+        {
+            await next(context);
+            return;
+        }
+
+        app.Logger.LogInformation($"IsWebSocketRequest: {context.WebSockets.IsWebSocketRequest}");
+        app.Logger.LogInformation($"Headers: {string.Join(", ", context.Request.Headers.Select(h => $"{h.Key}={h.Value}"))}");
+    
         var path = context.Request.Path.Value?.TrimStart('/').Split('/');
         if (path?.Length != 2)
         {
             context.Response.StatusCode = 400;
+            app.Logger.LogError("Invalid path format. Use /<remoteHost>/<remotePort>");
             await context.Response.WriteAsync("Invalid path format. Use /<remoteHost>/<remotePort>");
             return;
         }
-
+    
         string remoteHost = path[0];
         if (!int.TryParse(path[1], out int remotePort))
         {
             context.Response.StatusCode = 400;
+            app.Logger.LogError($"Invalid port number: {path[1]}");
             await context.Response.WriteAsync("Invalid port number");
             return;
         }
-
-        using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-        await HandleWebSocketConnection(webSocket, remoteHost, remotePort);
-    }
-    else
-    {
-        await next();
-    }
-});
-
-app.Run();
-
-async Task HandleWebSocketConnection(WebSocket webSocket, string remoteHost, int remotePort)
-{
-    try
-    {
-        using var tcpClient = new TcpClient();
-        await tcpClient.ConnectAsync(remoteHost, remotePort);
-        await using var networkStream = tcpClient.GetStream();
-
-        var cancellation = new CancellationTokenSource();
-        var receiveTask = ReceiveWebSocketMessages(webSocket, networkStream, cancellation.Token);
-        var sendTask = SendTcpDataToWebSocket(webSocket, networkStream, cancellation.Token);
-
-        await Task.WhenAny(receiveTask, sendTask);
-        cancellation.Cancel();
-
-        if (webSocket.State == WebSocketState.Open)
+    
+        if (!context.WebSockets.IsWebSocketRequest)
         {
-            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure,
-                "Connection closed", CancellationToken.None);
+            context.Response.StatusCode = 400;
+            app.Logger.LogError("Not a WebSocket request");
+            await context.Response.WriteAsync("Not a WebSocket request");
+            return;
+        }
+    
+        try
+        {
+            using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+            app.Logger.LogInformation("WebSocket connection established");
+            await HandleWebSocketConnection(webSocket, remoteHost, remotePort);
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogError(ex, "Error handling WebSocket connection");
+            if (!context.Response.HasStarted)
+            {
+                context.Response.StatusCode = 500;
+                await context.Response.WriteAsync("Internal Server Error");
+            }
+        }
+    });
+
+    app.Run();
+
+    async Task HandleWebSocketConnection(WebSocket webSocket, string remoteHost, int remotePort)
+    {
+        try
+        {
+            using var tcpClient = new TcpClient();
+            await tcpClient.ConnectAsync(remoteHost, remotePort);
+            await using var networkStream = tcpClient.GetStream();
+
+            var cancellation = new CancellationTokenSource();
+            var receiveTask = ReceiveWebSocketMessages(webSocket, networkStream, cancellation.Token);
+            var sendTask = SendTcpDataToWebSocket(webSocket, networkStream, cancellation.Token);
+            app.Logger.LogInformation($"Connection established to {remoteHost}:{remotePort}");
+            await Task.WhenAny(receiveTask, sendTask);
+            cancellation.Cancel();
+
+            if (webSocket.State == WebSocketState.Open)
+            {
+                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure,
+                    "Connection closed", CancellationToken.None);
+            }
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogError(ex, "Error in WebSocket connection");
+            if (webSocket.State == WebSocketState.Open)
+            {
+                await webSocket.CloseAsync(WebSocketCloseStatus.InternalServerError,
+                    "Connection error", CancellationToken.None);
+            }
         }
     }
-    catch (Exception ex)
+
+    async Task ReceiveWebSocketMessages(WebSocket webSocket, NetworkStream networkStream,
+        CancellationToken cancellationToken)
     {
-        app.Logger.LogError(ex, "Error in WebSocket connection");
-        if (webSocket.State == WebSocketState.Open)
+        var buffer = new byte[4096];
+        try
         {
-            await webSocket.CloseAsync(WebSocketCloseStatus.InternalServerError,
-                "Connection error", CancellationToken.None);
+            app.Logger.LogTrace("Start forwarding to Server...");
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    break;
+                app.Logger.LogTrace($"Forward {result.Count} bytes to Server...");
+                await networkStream.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal cancellation, ignore
+        }
+    }
+
+    async Task SendTcpDataToWebSocket(WebSocket webSocket, NetworkStream networkStream,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[4096];
+        try
+        {
+            app.Logger.LogTrace("Start forwarding to Client...");
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                int bytesRead = await networkStream.ReadAsync(buffer.AsMemory(), cancellationToken);
+                if (bytesRead == 0)
+                    break;
+
+                app.Logger.LogTrace($"Forward {bytesRead} bytes to Client...");
+                await webSocket.SendAsync(buffer.AsMemory(0, bytesRead),
+                    WebSocketMessageType.Binary, true, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal cancellation, ignore
         }
     }
 }
-
-async Task ReceiveWebSocketMessages(WebSocket webSocket, NetworkStream networkStream,
-    CancellationToken cancellationToken)
+catch (Exception ex)
 {
-    var buffer = new byte[4096];
-    try
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
-            if (result.MessageType == WebSocketMessageType.Close)
-                break;
-
-            await networkStream.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
-        }
-    }
-    catch (OperationCanceledException)
-    {
-        // Normal cancellation, ignore
-    }
+    logger.Error(ex, "Stopped program because of exception");
+    throw;
 }
-
-async Task SendTcpDataToWebSocket(WebSocket webSocket, NetworkStream networkStream,
-    CancellationToken cancellationToken)
+finally
 {
-    var buffer = new byte[4096];
-    try
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            int bytesRead = await networkStream.ReadAsync(buffer.AsMemory(), cancellationToken);
-            if (bytesRead == 0)
-                break;
-
-            await webSocket.SendAsync(buffer.AsMemory(0, bytesRead),
-                WebSocketMessageType.Binary, true, cancellationToken);
-        }
-    }
-    catch (OperationCanceledException)
-    {
-        // Normal cancellation, ignore
-    }
+    LogManager.Shutdown();
 }
