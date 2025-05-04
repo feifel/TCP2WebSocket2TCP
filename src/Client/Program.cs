@@ -10,7 +10,7 @@ class Program
     {
         if (args.Length != 4)
         {
-            Console.WriteLine("Usage: PortForwardClient <LocalPort> <ServerURL> <RemoteHost> <RemotePort>");
+            Console.WriteLine("Usage: Client.exe <LocalPort> <ServerURL> <RemoteHost> <RemotePort>");
             return;
         }
 
